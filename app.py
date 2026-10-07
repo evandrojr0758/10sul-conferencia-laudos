@@ -19,6 +19,29 @@ SUPABASE_SERVICE_KEY = secret('SUPABASE_SERVICE_KEY')
 
 st.markdown('''<style>.block-container{max-width:1500px;padding-top:1.2rem}.stButton>button{border-radius:10px;font-weight:700}[data-testid="stMetric"]{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 14px}</style>''', unsafe_allow_html=True)
 
+def buscar_ultima_itr_frota(frota):
+    """Busca na base publicada pelo sistema principal somente a ITR mais recente da frota."""
+    fr=re.sub(r'\D','',str(frota or ''))
+    if not fr:return None,'Informe a frota.'
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:return None,'Supabase não configurado.'
+    params=urllib.parse.urlencode({
+        'select':'os_id,frota,evento,inicio,fim',
+        'frota':f'eq.{fr}',
+        'evento':'ilike.*ITR*',
+        'order':'fim.desc.nullslast,inicio.desc',
+        'limit':'1'
+    })
+    url=f'{SUPABASE_URL}/rest/v1/monitor_atendimentos?{params}'
+    req=urllib.request.Request(url,headers={'apikey':SUPABASE_SERVICE_KEY,'Authorization':f'Bearer {SUPABASE_SERVICE_KEY}'})
+    try:
+        with urllib.request.urlopen(req,timeout=30) as resp:
+            rows=json.loads(resp.read().decode() or '[]')
+        if not rows:return None,f'Nenhuma ITR encontrada para a frota {fr}.'
+        return rows[0],None
+    except urllib.error.HTTPError as e:
+        return None,f'Supabase HTTP {e.code}: '+e.read().decode(errors='ignore')[:500]
+    except Exception as e:return None,str(e)
+
 def parse_json(text):
     text=re.sub(r'^```(?:json)?\s*','',str(text or '').strip(),flags=re.I); text=re.sub(r'\s*```$','',text); a,b=text.find('{'),text.rfind('}')
     if a>=0 and b>a:text=text[a:b+1]
@@ -246,9 +269,49 @@ if isinstance(bulk,pd.DataFrame):
         cols=['SELECIONAR','ID','FROTA','INICIO OS','FIM OS','ATIVIDADE/DESCRIÇÃO','EXECUTANTE','ITR','CNP','GM','OUTROS','INICIO','FIM','_PAGINA','_COMPARTIMENTO']
         for c in cols:
             if c not in bulk.columns: bulk[c]=True if c=='SELECIONAR' else ''
+        st.markdown('#### 🔎 Buscar última ITR pela frota')
+        q1,q2=st.columns([2,1])
+        frota_busca=q1.text_input('FROTA',placeholder='Ex.: 13809',key=f'buscar_frota_{bulk_key}')
+        if q2.button('🔎 BUSCAR ÚLTIMA ITR',use_container_width=True,key=f'btn_buscar_itr_{bulk_key}'):
+            with st.spinner('Buscando na base do sistema principal...'):
+                achado,erro=buscar_ultima_itr_frota(frota_busca)
+            if erro:
+                st.session_state.pop(f'itr_achada_{bulk_key}',None)
+                st.error(erro)
+            else:
+                st.session_state[f'itr_achada_{bulk_key}']=achado
+        achado=st.session_state.get(f'itr_achada_{bulk_key}')
+        if achado:
+            ini=pd.to_datetime(achado.get('inicio'),errors='coerce')
+            fim=pd.to_datetime(achado.get('fim'),errors='coerce')
+            resumo=pd.DataFrame([{
+                'ID':str(achado.get('os_id','')),
+                'FROTA':str(achado.get('frota','')),
+                'INICIO':'' if pd.isna(ini) else ini.strftime('%d/%m/%Y %H:%M'),
+                'FIM':'' if pd.isna(fim) else fim.strftime('%d/%m/%Y %H:%M')
+            }])
+            st.dataframe(resumo,hide_index=True,use_container_width=True)
+            st.caption('Esta é somente a ITR mais recente encontrada para a frota.')
+            if st.button('↙️ PREENCHER ESTA ITR NO LAUDO',type='primary',use_container_width=True,key=f'aplicar_itr_{bulk_key}'):
+                fr=str(achado.get('frota','')).strip()
+                mask=bulk['FROTA'].astype(str).str.replace(r'\\D','',regex=True).eq(re.sub(r'\\D','',fr))
+                if not mask.any():
+                    st.warning(f'A frota {fr} não está nas linhas lidas deste PDF.')
+                else:
+                    bulk.loc[mask,'ID']=str(achado.get('os_id',''))
+                    bulk.loc[mask,'FROTA']=fr
+                    bulk.loc[mask,'INICIO OS']='' if pd.isna(ini) else ini.strftime('%d/%m/%Y %H:%M')
+                    bulk.loc[mask,'FIM OS']='' if pd.isna(fim) else fim.strftime('%d/%m/%Y %H:%M')
+                    st.session_state[bulk_key]=bulk
+                    # troca a chave do editor para reconstruir a grade com os valores preenchidos
+                    st.session_state[f'editor_rev_{bulk_key}']=st.session_state.get(f'editor_rev_{bulk_key}',0)+1
+                    st.success(f'✅ OS {achado.get("os_id","")} aplicada às atividades da frota {fr}.')
+                    st.rerun()
+
         st.markdown('#### Conferência — tudo abaixo é editável')
+        _rev=st.session_state.get(f'editor_rev_{bulk_key}',0)
         edit=st.data_editor(
-            bulk[cols],num_rows='dynamic',hide_index=True,use_container_width=True,height=620,key=f'editor_{bulk_key}',
+            bulk[cols],num_rows='dynamic',hide_index=True,use_container_width=True,height=620,key=f'editor_{bulk_key}_{_rev}',
             disabled=['_PAGINA','_COMPARTIMENTO'],
             column_config={
                 'SELECIONAR':st.column_config.CheckboxColumn('✓',help='Somente linhas marcadas serão validadas e gravadas.'),
