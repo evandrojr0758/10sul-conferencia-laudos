@@ -151,7 +151,7 @@ def pagina_para_linhas(data, pagina):
         if not serv: continue
         cl=str(a.get('classificacao','') or '').upper().strip()
         rows.append({
-            'ID':osid,'FROTA':frota,'INICIO OS':ini_os,'FIM OS':fim_os,
+            'SELECIONAR':True,'ID':osid,'FROTA':frota,'INICIO OS':ini_os,'FIM OS':fim_os,
             'ATIVIDADE/DESCRIÇÃO':serv,'EXECUTANTE':str(a.get('executante','') or '').strip(),
             'ITR':cl=='ITR','CNP':cl=='CNP','GM':cl=='GM','OUTROS':cl=='OUTROS',
             'INICIO':str(a.get('inicio','') or '').strip(),'FIM':str(a.get('fim','') or '').strip(),
@@ -163,6 +163,9 @@ def salvar_lote(df):
     erros=[]; total=0
     if df is None or df.empty: return False,'Nenhuma atividade para salvar.'
     work=df.copy()
+    if 'SELECIONAR' in work.columns:
+        work=work[work['SELECIONAR'].fillna(False).astype(bool)].copy()
+    if work.empty:return False,'Nenhum laudo marcado para gravar.'
     for (osid,frota,comp),g in work.groupby(['ID','FROTA','_COMPARTIMENTO'],dropna=False):
         if not str(osid).strip() or not str(frota).strip():
             erros.append('Há linha sem ID ou FROTA.'); continue
@@ -240,14 +243,15 @@ if isinstance(bulk,pd.DataFrame):
     if bulk.empty:
         st.warning('O Gemini não encontrou atividades nas páginas.')
     else:
-        cols=['ID','FROTA','INICIO OS','FIM OS','ATIVIDADE/DESCRIÇÃO','EXECUTANTE','ITR','CNP','GM','OUTROS','INICIO','FIM','_PAGINA','_COMPARTIMENTO']
+        cols=['SELECIONAR','ID','FROTA','INICIO OS','FIM OS','ATIVIDADE/DESCRIÇÃO','EXECUTANTE','ITR','CNP','GM','OUTROS','INICIO','FIM','_PAGINA','_COMPARTIMENTO']
         for c in cols:
-            if c not in bulk.columns: bulk[c]=''
+            if c not in bulk.columns: bulk[c]=True if c=='SELECIONAR' else ''
         st.markdown('#### Conferência — tudo abaixo é editável')
         edit=st.data_editor(
             bulk[cols],num_rows='dynamic',hide_index=True,use_container_width=True,height=620,key=f'editor_{bulk_key}',
             disabled=['_PAGINA','_COMPARTIMENTO'],
             column_config={
+                'SELECIONAR':st.column_config.CheckboxColumn('✓',help='Somente linhas marcadas serão validadas e gravadas.'),
                 'ITR':st.column_config.CheckboxColumn('ITR'),
                 'CNP':st.column_config.CheckboxColumn('CNP'),
                 'GM':st.column_config.CheckboxColumn('GM'),
@@ -257,8 +261,10 @@ if isinstance(bulk,pd.DataFrame):
             }
         )
         a,b=st.columns([3,1])
-        if a.button('✅ CONFIRMAR E GRAVAR TODOS OS LAUDOS',type='primary',use_container_width=True,key='gravar_lote'):
-            with st.spinner('Gravando laudos conferidos...'):
+        selecionadas=int(edit['SELECIONAR'].fillna(False).astype(bool).sum()) if 'SELECIONAR' in edit.columns else len(edit)
+        a.caption(f'{selecionadas} atividade(s) marcada(s) para gravação. Desmarcadas serão ignoradas inclusive nas validações.')
+        if a.button('✅ CONFIRMAR E GRAVAR SOMENTE OS MARCADOS',type='primary',use_container_width=True,key='gravar_lote'):
+            with st.spinner('Gravando somente os laudos marcados...'):
                 ok,msg=salvar_lote(edit)
             if ok:
                 st.success('✅ '+msg)
