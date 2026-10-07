@@ -39,9 +39,9 @@ def ler_gemini(png_bytes):
     preview,imgs=image_versions(png_bytes)
     prompt='''Leia este LAUDO DE INSPEÇÃO DE CARRETA da 10 Sul Service. As imagens são a mesma página em rotações diferentes; use somente a orientação legível e NÃO duplique linhas.
 Identifique PRIMEIRO OS/ID (rótulos ID, OS, Nº OS, N° OS, ORDEM DE SERVIÇO), retornando somente dígitos e nunca inventando. Leia FROTA/SR, data do laudo, compartimento 1º/2º/3º, INÍCIO MANUTENÇÃO e FIM MANUTENÇÃO do cabeçalho.
-Transcreva TODAS as linhas preenchidas: atividade/serviço, INÍCIO, FIM e classificação ITR/CNP/GM/OUTROS. Horários de atividade devem vir apenas das colunas INÍCIO e FIM da mesma linha. Se ilegível/vazio, retorne string vazia. Horário válido em HH:MM. Não use tempo estimado.
+Transcreva TODAS as linhas preenchidas: atividade/serviço, EXECUTANTE, INÍCIO, FIM e classificação ITR/CNP/GM/OUTROS. Horários de atividade devem vir apenas das colunas INÍCIO e FIM da mesma linha. Se ilegível/vazio, retorne string vazia. Horário válido em HH:MM. Não use tempo estimado.
 Retorne SOMENTE JSON:
-{"id_os":"","frota":"","data_inspecao":"","compartimento":"1º","inicio_manutencao":"","fim_manutencao":"","atividades":[{"servico":"Regular freio","inicio":"07:45","fim":"08:01","classificacao":"ITR"}],"confianca":0.0}'''
+{"id_os":"","frota":"","data_inspecao":"","compartimento":"1º","inicio_manutencao":"","fim_manutencao":"","atividades":[{"servico":"Regular freio","executante":"","inicio":"07:45","fim":"08:01","classificacao":"ITR"}],"confianca":0.0}'''
     parts=[{'text':prompt}]+[{'inline_data':{'mime_type':'image/jpeg','data':x}} for x in imgs]
     payload={'contents':[{'role':'user','parts':parts}],'generationConfig':{'responseMimeType':'application/json','temperature':0.0,'maxOutputTokens':8000}}
     url=f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'; req=urllib.request.Request(url,data=json.dumps(payload).encode(),headers={'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json'},method='POST')
@@ -73,6 +73,72 @@ def supabase_upsert(rows,os_id,frota,compartimento):
 
 def iso(dt):return pd.Timestamp(dt).strftime('%Y-%m-%dT%H:%M:%S')
 
+
+def pagina_para_linhas(data, pagina):
+    if not data or data.get('_erro'):
+        return []
+    osid=str(data.get('id_os','') or '').strip()
+    frota=str(data.get('frota','') or '').strip()
+    d0=pd.to_datetime(data.get('data_inspecao'),dayfirst=True,errors='coerce')
+    if pd.isna(d0): d0=pd.Timestamp.today()
+    dia=d0.date()
+    def osdt(v):
+        s=str(v or '').strip()
+        z=pd.to_datetime(s,dayfirst=True,errors='coerce')
+        if not pd.isna(z) and (':' in s or 'T' in s): return z.strftime('%d/%m/%Y %H:%M')
+        h=hora(s)
+        return datetime.combine(dia,h).strftime('%d/%m/%Y %H:%M') if h else ''
+    ini_os=osdt(data.get('inicio_manutencao'))
+    fim_os=osdt(data.get('fim_manutencao'))
+    rows=[]
+    for a in data.get('atividades',[]) or []:
+        serv=str(a.get('servico','') or '').strip()
+        if not serv: continue
+        cl=str(a.get('classificacao','') or '').upper().strip()
+        rows.append({
+            'ID':osid,'FROTA':frota,'INICIO OS':ini_os,'FIM OS':fim_os,
+            'ATIVIDADE/DESCRIÇÃO':serv,'EXECUTANTE':str(a.get('executante','') or '').strip(),
+            'ITR':cl=='ITR','CNP':cl=='CNP','GM':cl=='GM','OUTROS':cl=='OUTROS',
+            'INICIO':str(a.get('inicio','') or '').strip(),'FIM':str(a.get('fim','') or '').strip(),
+            '_PAGINA':int(pagina),'_COMPARTIMENTO':str(data.get('compartimento','1º') or '1º')
+        })
+    return rows
+
+def salvar_lote(df):
+    erros=[]; total=0
+    if df is None or df.empty: return False,'Nenhuma atividade para salvar.'
+    work=df.copy()
+    for (osid,frota,comp),g in work.groupby(['ID','FROTA','_COMPARTIMENTO'],dropna=False):
+        if not str(osid).strip() or not str(frota).strip():
+            erros.append('Há linha sem ID ou FROTA.'); continue
+        rows=[]
+        for i,r in g.iterrows():
+            ativ=str(r.get('ATIVIDADE/DESCRIÇÃO','') or '').strip()
+            if not ativ: continue
+            marc=[x for x in ['ITR','CNP','GM','OUTROS'] if bool(r.get(x,False))]
+            if len(marc)!=1:
+                erros.append(f'{osid} / {frota}: marque exatamente um tipo em {ativ}.'); continue
+            try:
+                ini_os=pd.to_datetime(r.get('INICIO OS'),dayfirst=True)
+                fim_os=pd.to_datetime(r.get('FIM OS'),dayfirst=True)
+            except:
+                erros.append(f'{osid} / {frota}: confira INICIO OS e FIM OS.'); continue
+            h1,h2=hora(r.get('INICIO')),hora(r.get('FIM'))
+            if not h1 or not h2:
+                erros.append(f'{osid} / {frota}: confira INICIO/FIM da atividade {ativ}.'); continue
+            d1=pd.Timestamp(datetime.combine(ini_os.date(),h1)); d2=pd.Timestamp(datetime.combine(ini_os.date(),h2))
+            if d2<d1:d2+=pd.Timedelta(days=1)
+            reg=f'WEB_LOTE_{st.session_state.get("pdf_hash","")}_{int(r.get("_PAGINA",0))}'
+            rows.append({'registro':reg,'os_id':str(osid).strip(),'frota':str(frota).strip(),'compartimento':str(comp),'status':'CONFERIDO',
+                'inicio_manutencao':iso(ini_os),'fim_manutencao':iso(fim_os),'atividade_id':f'{reg}_{i}',
+                'atividade':ativ,'executante':str(r.get('EXECUTANTE','') or '').strip(),'classificacao':marc[0],
+                'inicio_atividade':iso(d1),'fim_atividade':iso(d2),'horas':max(0,(d2-d1).total_seconds()/3600),'evidencias':'[]'})
+        if rows:
+            ok,msg=supabase_upsert(rows,str(osid).strip(),str(frota).strip(),str(comp))
+            if ok: total+=len(rows)
+            else: erros.append(f'{osid}/{frota}: {msg}')
+    return (len(erros)==0, f'{total} atividade(s) sincronizada(s).' if not erros else ' | '.join(erros[:5]))
+
 st.title('📄 10 Sul • Central de Conferência de Laudos')
 st.caption('Portal independente para leitura e conferência de laudos escaneados. Somente dados confirmados são enviados ao monitor.')
 pdf=st.file_uploader('📤 Selecione o PDF com os laudos escaneados',type=['pdf'])
@@ -85,6 +151,65 @@ if st.session_state.get('pdf_hash')!=pdf_hash:
     st.session_state['pdf_hash']=pdf_hash;st.session_state['pag']=1;st.session_state['ok_pages']=set();st.session_state.pop('leitura',None)
 ok_pages=st.session_state.setdefault('ok_pages',set())
 m1,m2,m3=st.columns(3);m1.metric('PÁGINAS',n);m2.metric('CONFERIDAS',len(ok_pages));m3.metric('PENDENTES',n-len(ok_pages));st.progress(len(ok_pages)/max(n,1),text=f'{len(ok_pages)}/{n} páginas conferidas nesta sessão')
+
+
+st.divider()
+st.subheader('🚀 Lançamento em lote')
+st.caption('Lê todas as páginas com Gemini, monta uma linha por atividade e só grava depois da sua conferência.')
+bulk_key=f'bulk_{pdf_hash}'
+if st.button(f'🤖 LER TODAS AS {n} PÁGINAS COM GEMINI',type='primary',use_container_width=True,key='ler_todas'):
+    linhas=[]; falhas=[]; barra=st.progress(0,text='Iniciando leitura em lote...')
+    for p in range(1,n+1):
+        pg=doc.load_page(p-1); px=pg.get_pixmap(matrix=fitz.Matrix(1.6,1.6),alpha=False); img=px.tobytes('png')
+        dados=ler_gemini(img)
+        if dados.get('_erro'): falhas.append(f'Página {p}: {dados["_erro"]}')
+        else: linhas.extend(pagina_para_linhas(dados,p))
+        barra.progress(p/max(n,1),text=f'Lendo página {p} de {n}...')
+    st.session_state[bulk_key]=pd.DataFrame(linhas)
+    st.session_state[f'{bulk_key}_falhas']=falhas
+    barra.empty()
+    st.rerun()
+
+bulk=st.session_state.get(bulk_key)
+if isinstance(bulk,pd.DataFrame):
+    falhas=st.session_state.get(f'{bulk_key}_falhas',[])
+    c1,c2,c3=st.columns(3)
+    c1.metric('ATIVIDADES LIDAS',len(bulk))
+    c2.metric('LAUDOS/OS',bulk['ID'].nunique() if not bulk.empty else 0)
+    c3.metric('PÁGINAS COM FALHA',len(falhas))
+    if falhas:
+        with st.expander('⚠️ Ver páginas que precisam ser relidas'):
+            for x in falhas: st.warning(x)
+    if bulk.empty:
+        st.warning('O Gemini não encontrou atividades nas páginas.')
+    else:
+        cols=['ID','FROTA','INICIO OS','FIM OS','ATIVIDADE/DESCRIÇÃO','EXECUTANTE','ITR','CNP','GM','OUTROS','INICIO','FIM','_PAGINA','_COMPARTIMENTO']
+        for c in cols:
+            if c not in bulk.columns: bulk[c]=''
+        st.markdown('#### Conferência — tudo abaixo é editável')
+        edit=st.data_editor(
+            bulk[cols],num_rows='dynamic',hide_index=True,use_container_width=True,height=620,key=f'editor_{bulk_key}',
+            disabled=['_PAGINA','_COMPARTIMENTO'],
+            column_config={
+                'ITR':st.column_config.CheckboxColumn('ITR'),
+                'CNP':st.column_config.CheckboxColumn('CNP'),
+                'GM':st.column_config.CheckboxColumn('GM'),
+                'OUTROS':st.column_config.CheckboxColumn('OUTROS'),
+                '_PAGINA':st.column_config.NumberColumn('PÁGINA'),
+                '_COMPARTIMENTO':st.column_config.TextColumn('COMP.')
+            }
+        )
+        a,b=st.columns([3,1])
+        if a.button('✅ CONFIRMAR E GRAVAR TODOS OS LAUDOS',type='primary',use_container_width=True,key='gravar_lote'):
+            with st.spinner('Gravando laudos conferidos...'):
+                ok,msg=salvar_lote(edit)
+            if ok:
+                st.success('✅ '+msg)
+                st.session_state[bulk_key]=edit
+            else: st.error(msg)
+        if b.button('🗑️ LIMPAR LEITURA',use_container_width=True,key='limpar_lote'):
+            st.session_state.pop(bulk_key,None); st.session_state.pop(f'{bulk_key}_falhas',None); st.rerun()
+
 pag=st.number_input('Página',1,n,value=min(int(st.session_state.get('pag',1)),n),step=1);st.session_state['pag']=int(pag)
 page=doc.load_page(int(pag)-1);pix=page.get_pixmap(matrix=fitz.Matrix(1.6,1.6),alpha=False);png=pix.tobytes('png');preview,_=image_versions(png)
 rotkey=f'rot_{pdf_hash}_{pag}';st.session_state.setdefault(rotkey,False)
