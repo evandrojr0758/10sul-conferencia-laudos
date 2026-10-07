@@ -24,30 +24,85 @@ def parse_json(text):
     if a>=0 and b>a:text=text[a:b+1]
     return json.loads(text)
 
-def image_versions(png_bytes):
+def preparar_imagem(png_bytes):
     img=Image.open(BytesIO(png_bytes)).convert('RGB')
-    if img.height>img.width: img=img.rotate(90,expand=True)
     if max(img.size)>1800:
         k=1800/max(img.size); img=img.resize((int(img.width*k),int(img.height*k)))
-    out=[]
-    for ang in (0,180):
-        im=img.rotate(ang,expand=True) if ang else img.copy(); bio=BytesIO(); im.save(bio,format='JPEG',quality=88,optimize=True); out.append(base64.b64encode(bio.getvalue()).decode('ascii'))
-    bio=BytesIO(); img.save(bio,format='PNG'); return bio.getvalue(),out
+    return img
 
-def ler_gemini(png_bytes):
+def jpg_b64(img):
+    bio=BytesIO(); img.save(bio,format='JPEG',quality=90,optimize=True)
+    return base64.b64encode(bio.getvalue()).decode('ascii')
+
+def detectar_orientacao(png_bytes):
+    """Decide 0/180 antes da extração. O laudo é paisagem; frente/verso pode vir invertido."""
+    if not GEMINI_API_KEY:return 0
+    img=preparar_imagem(png_bytes)
+    a=jpg_b64(img); b=jpg_b64(img.rotate(180,expand=True))
+    prompt='''Estas duas imagens são a MESMA página de um formulário "LAUDO DE INSPEÇÃO DE CARRETA", uma normal e outra girada 180 graus.
+Escolha qual está em pé para leitura humana: título no topo, FROTA/SR no cabeçalho, tabela abaixo e OBSERVAÇÕES no rodapé.
+Retorne SOMENTE JSON {"rotacao":0} se a PRIMEIRA estiver correta, ou {"rotacao":180} se a SEGUNDA estiver correta.'''
+    payload={'contents':[{'role':'user','parts':[{'text':prompt},{'inline_data':{'mime_type':'image/jpeg','data':a}},{'inline_data':{'mime_type':'image/jpeg','data':b}}]}],
+             'generationConfig':{'responseMimeType':'application/json','temperature':0.0,'maxOutputTokens':100}}
+    url=f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
+    req=urllib.request.Request(url,data=json.dumps(payload).encode(),headers={'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json'},method='POST')
+    try:
+        with urllib.request.urlopen(req,timeout=90) as resp: raw=json.loads(resp.read().decode())
+        txt='\n'.join(p.get('text','') for p in raw.get('candidates',[{}])[0].get('content',{}).get('parts',[]) if p.get('text'))
+        return 180 if int(parse_json(txt).get('rotacao',0))==180 else 0
+    except Exception:
+        return 0
+
+def normalizar_orientacao(png_bytes):
+    img=preparar_imagem(png_bytes)
+    rot=detectar_orientacao(png_bytes)
+    if rot==180: img=img.rotate(180,expand=True)
+    bio=BytesIO(); img.save(bio,format='PNG')
+    return bio.getvalue(),rot
+
+def image_versions(png_bytes):
+    # Mantido para a prévia manual: agora retorna somente a imagem já preparada.
+    img=preparar_imagem(png_bytes)
+    bio=BytesIO(); img.save(bio,format='PNG')
+    return bio.getvalue(),[jpg_b64(img)]
+
+def ler_gemini(png_bytes, ja_orientada=False):
     if not GEMINI_API_KEY:return {'_erro':'GEMINI_API_KEY não configurada nos Secrets.'}
-    preview,imgs=image_versions(png_bytes)
-    prompt='''Leia este LAUDO DE INSPEÇÃO DE CARRETA da 10 Sul Service. As imagens são a mesma página em rotações diferentes; use somente a orientação legível e NÃO duplique linhas.
-Identifique PRIMEIRO OS/ID (rótulos ID, OS, Nº OS, N° OS, ORDEM DE SERVIÇO), retornando somente dígitos e nunca inventando. Leia FROTA/SR, data do laudo, compartimento 1º/2º/3º, INÍCIO MANUTENÇÃO e FIM MANUTENÇÃO do cabeçalho.
-Transcreva TODAS as linhas preenchidas: atividade/serviço, EXECUTANTE, INÍCIO, FIM e classificação ITR/CNP/GM/OUTROS. Horários de atividade devem vir apenas das colunas INÍCIO e FIM da mesma linha. Se ilegível/vazio, retorne string vazia. Horário válido em HH:MM. Não use tempo estimado.
+    if ja_orientada:
+        img=preparar_imagem(png_bytes); rot=0
+        bio=BytesIO(); img.save(bio,format='PNG'); preview=bio.getvalue()
+    else:
+        preview,rot=normalizar_orientacao(png_bytes)
+        img=preparar_imagem(preview)
+    prompt='''Leia este formulário 10 Sul "LAUDO DE INSPEÇÃO DE CARRETA". A página JÁ FOI COLOCADA NA ORIENTAÇÃO CORRETA. Não gire mentalmente e não misture campos.
+
+REGRAS FIXAS DO FORMULÁRIO:
+1. FROTA: leia SOMENTE o campo "FROTA / SR:" no canto superior esquerdo. Deve ser o número da frota. Nunca coloque nome de pessoa em FROTA.
+2. ID/OS: somente preencha se existir um número explicitamente identificado como ID, Nº OS, N° OS ou ORDEM DE SERVIÇO. O campo "OS / EVENTO" pode conter ITR e NÃO é o ID. "Nº LAUDO" também NÃO é ID. Se não houver ID/OS explícito, retorne vazio. NUNCA copie a FROTA para ID.
+3. DATA DA INSPEÇÃO: leia somente o campo com esse rótulo.
+4. INÍCIO MANUTENÇÃO e FIM MANUTENÇÃO: leia SOMENTE esses dois campos do cabeçalho. NÃO use o quadro "TEMPO DA ITR".
+5. Cada linha da tabela possui ATIVIDADE/SERVIÇO, EXECUTANTE, marcação ITR/CNP/GM/OUTROS e TEMPO REAL INÍCIO/FIM. Preserve a associação horizontal da MESMA LINHA.
+6. EXECUTANTE vem exclusivamente da coluna EXECUTANTE. Se vazio/ilegível, retorne vazio.
+7. INÍCIO e FIM de atividade vêm exclusivamente das colunas "TEMPO REAL > INÍCIO" e "TEMPO REAL > FIM". Não use TEMPO ESTIMADO nem TEMPO DA ITR.
+8. Classificação: marque somente a coluna que tiver X na mesma linha. Se não for possível identificar, use OUTROS.
+9. Compartimento: identifique 1º, 2º ou 3º pelo título da tabela.
+10. Não invente. Campo duvidoso deve ficar vazio.
+
 Retorne SOMENTE JSON:
-{"id_os":"","frota":"","data_inspecao":"","compartimento":"1º","inicio_manutencao":"","fim_manutencao":"","atividades":[{"servico":"Regular freio","executante":"","inicio":"07:45","fim":"08:01","classificacao":"ITR"}],"confianca":0.0}'''
-    parts=[{'text':prompt}]+[{'inline_data':{'mime_type':'image/jpeg','data':x}} for x in imgs]
-    payload={'contents':[{'role':'user','parts':parts}],'generationConfig':{'responseMimeType':'application/json','temperature':0.0,'maxOutputTokens':8000}}
-    url=f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'; req=urllib.request.Request(url,data=json.dumps(payload).encode(),headers={'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json'},method='POST')
+{"id_os":"","frota":"","data_inspecao":"","compartimento":"1º","inicio_manutencao":"","fim_manutencao":"","atividades":[{"servico":"","executante":"","inicio":"","fim":"","classificacao":"ITR"}],"confianca":0.0}'''
+    payload={'contents':[{'role':'user','parts':[{'text':prompt},{'inline_data':{'mime_type':'image/jpeg','data':jpg_b64(img)}}]}],
+             'generationConfig':{'responseMimeType':'application/json','temperature':0.0,'maxOutputTokens':8000}}
+    url=f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
+    req=urllib.request.Request(url,data=json.dumps(payload).encode(),headers={'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json'},method='POST')
     try:
         with urllib.request.urlopen(req,timeout=150) as resp:raw=json.loads(resp.read().decode())
-        txt='\n'.join(p.get('text','') for p in raw.get('candidates',[{}])[0].get('content',{}).get('parts',[]) if p.get('text')); return parse_json(txt)
+        txt='\n'.join(p.get('text','') for p in raw.get('candidates',[{}])[0].get('content',{}).get('parts',[]) if p.get('text'))
+        data=parse_json(txt); data['_rotacao_aplicada']=rot
+        frota=re.sub(r'\D','',str(data.get('frota','') or ''))
+        osid=re.sub(r'\D','',str(data.get('id_os','') or ''))
+        data['frota']=frota
+        data['id_os']='' if (osid and frota and osid==frota) else osid
+        return data
     except urllib.error.HTTPError as e:return {'_erro':f'Gemini HTTP {e.code}: '+e.read().decode(errors='ignore')[:800]}
     except Exception as e:return {'_erro':f'{type(e).__name__}: {e}'}
 
@@ -161,7 +216,9 @@ if st.button(f'🤖 LER TODAS AS {n} PÁGINAS COM GEMINI',type='primary',use_con
     linhas=[]; falhas=[]; barra=st.progress(0,text='Iniciando leitura em lote...')
     for p in range(1,n+1):
         pg=doc.load_page(p-1); px=pg.get_pixmap(matrix=fitz.Matrix(1.6,1.6),alpha=False); img=px.tobytes('png')
-        dados=ler_gemini(img)
+        img_corrigida,rot=normalizar_orientacao(img)
+        dados=ler_gemini(img_corrigida,ja_orientada=True)
+        dados['_rotacao_aplicada']=rot
         if dados.get('_erro'): falhas.append(f'Página {p}: {dados["_erro"]}')
         else: linhas.extend(pagina_para_linhas(dados,p))
         barra.progress(p/max(n,1),text=f'Lendo página {p} de {n}...')
