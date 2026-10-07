@@ -20,7 +20,7 @@ SUPABASE_SERVICE_KEY = secret('SUPABASE_SERVICE_KEY')
 st.markdown('''<style>.block-container{max-width:1500px;padding-top:1.2rem}.stButton>button{border-radius:10px;font-weight:700}[data-testid="stMetric"]{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 14px}</style>''', unsafe_allow_html=True)
 
 def buscar_ultima_itr_frota(frota):
-    """Busca na base publicada pelo sistema principal somente a ITR mais recente da frota."""
+    """Busca na base publicada pelo sistema principal a ITR mais recente por início, incluindo OS abertas."""
     fr=re.sub(r'\D','',str(frota or ''))
     if not fr:return None,'Informe a frota.'
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:return None,'Supabase não configurado.'
@@ -28,7 +28,7 @@ def buscar_ultima_itr_frota(frota):
         'select':'os_id,frota,evento,inicio,fim',
         'frota':f'eq.{fr}',
         'evento':'ilike.*ITR*',
-        'order':'fim.desc.nullslast,inicio.desc',
+        'order':'inicio.desc.nullslast,parada.desc.nullslast',
         'limit':'1'
     })
     url=f'{SUPABASE_URL}/rest/v1/monitor_atendimentos?{params}'
@@ -291,7 +291,7 @@ if isinstance(bulk,pd.DataFrame):
                 'FIM':'' if pd.isna(fim) else fim.strftime('%d/%m/%Y %H:%M')
             }])
             st.dataframe(resumo,hide_index=True,use_container_width=True)
-            st.caption('Esta é somente a ITR mais recente encontrada para a frota.')
+            st.caption('ITR mais recente por início, incluindo OS abertas. O FIM informado no laudo é preservado; o FIM da cliente é consultado separadamente pelo monitor.')
             if st.button('↙️ PREENCHER ESTA ITR NO LAUDO',type='primary',use_container_width=True,key=f'aplicar_itr_{bulk_key}'):
                 fr=str(achado.get('frota','')).strip()
                 mask=bulk['FROTA'].astype(str).str.replace(r'\\D','',regex=True).eq(re.sub(r'\\D','',fr))
@@ -301,7 +301,10 @@ if isinstance(bulk,pd.DataFrame):
                     bulk.loc[mask,'ID']=str(achado.get('os_id',''))
                     bulk.loc[mask,'FROTA']=fr
                     bulk.loc[mask,'INICIO OS']='' if pd.isna(ini) else ini.strftime('%d/%m/%Y %H:%M')
-                    bulk.loc[mask,'FIM OS']='' if pd.isna(fim) else fim.strftime('%d/%m/%Y %H:%M')
+                    # Nunca apagar ou substituir o FIM informado pelo conferente.
+                    fim_vazio=bulk['FIM OS'].fillna('').astype(str).str.strip().eq('')
+                    if pd.notna(fim):
+                        bulk.loc[mask & fim_vazio,'FIM OS']=fim.strftime('%d/%m/%Y %H:%M')
                     st.session_state[bulk_key]=bulk
                     # troca a chave do editor para reconstruir a grade com os valores preenchidos
                     st.session_state[f'editor_rev_{bulk_key}']=st.session_state.get(f'editor_rev_{bulk_key}',0)+1
