@@ -21,26 +21,42 @@ SUPABASE_SERVICE_KEY = secret('SUPABASE_SERVICE_KEY')
 st.markdown('''<style>.block-container{max-width:1500px;padding-top:1.2rem}.stButton>button{border-radius:10px;font-weight:700}[data-testid="stMetric"]{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 14px}</style>''', unsafe_allow_html=True)
 
 def buscar_ultima_itr_frota(frota):
-    """Busca na base publicada pelo sistema principal a ITR mais recente pelo início (ou parada, quando ainda não iniciou), independentemente do status."""
+    """Busca na base publicada pelo sistema principal a ITR mais recente nas bases ASN e histórico, pelo início ou parada, independentemente do status."""
     fr=re.sub(r'\D','',str(frota or ''))
     if not fr:return None,'Informe a frota.'
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:return None,'Supabase não configurado.'
-    params=urllib.parse.urlencode({
-        'select':'os_id,frota,evento,status,parada,inicio,fim',
-        'frota':f'eq.{fr}',
-        'evento':'ilike.*ITR*',
-        'order':'inicio.desc.nullslast,parada.desc.nullslast',
-        'limit':'1000'
-    })
-    url=f'{SUPABASE_URL}/rest/v1/monitor_atendimentos?{params}'
-    req=urllib.request.Request(url,headers={'apikey':SUPABASE_SERVICE_KEY,'Authorization':f'Bearer {SUPABASE_SERVICE_KEY}'})
+    def consultar(tabela):
+        todas=[]; offset=0
+        while True:
+            params=urllib.parse.urlencode({
+                'select':'os_id,frota,evento,status,parada,inicio,fim',
+                'frota':f'eq.{fr}',
+                'evento':'ilike.*ITR*',
+                'order':'os_id.asc',
+                'limit':'1000','offset':str(offset)
+            })
+            url=f'{SUPABASE_URL}/rest/v1/{tabela}?{params}'
+            req=urllib.request.Request(url,headers={'apikey':SUPABASE_SERVICE_KEY,'Authorization':f'Bearer {SUPABASE_SERVICE_KEY}'})
+            with urllib.request.urlopen(req,timeout=30) as resp:
+                pagina=json.loads(resp.read().decode() or '[]')
+            todas.extend(pagina)
+            if len(pagina)<1000:return todas
+            offset+=len(pagina)
     try:
-        with urllib.request.urlopen(req,timeout=30) as resp:
-            rows=json.loads(resp.read().decode() or '[]')
+        historico=consultar('monitor_atendimentos')
+        asn=consultar('monitor_asn')
+        registros={str(row['os_id']):dict(row) for row in historico}
+        for row in asn:
+            chave=str(row['os_id'])
+            anterior=registros.get(chave,{})
+            inicio_salvo=anterior.get('inicio')
+            registros[chave]={**anterior,**row}
+            if pd.notna(pd.to_datetime(inicio_salvo,errors='coerce')):
+                registros[chave]['inicio']=inicio_salvo
+        rows=list(registros.values())
         if not rows:return None,f'Nenhuma ITR encontrada para a frota {fr}.'
         def data_referencia(row):
-            value=row.get('inicio') or row.get('parada')
-            stamp=pd.to_datetime(value,errors='coerce',utc=True)
+            stamp=pd.to_datetime(row.get('inicio') or row.get('parada'),errors='coerce',utc=True)
             return stamp.value if pd.notna(stamp) else -9223372036854775808
         return max(rows,key=data_referencia),None
     except urllib.error.HTTPError as e:
@@ -324,7 +340,7 @@ if isinstance(bulk,pd.DataFrame):
                 'FIM':'' if pd.isna(fim) else fim.strftime('%d/%m/%Y %H:%M')
             }])
             st.dataframe(resumo,hide_index=True,use_container_width=True)
-            st.caption('ITR mais recente por início, incluindo OS abertas. O FIM informado no laudo é preservado; o FIM da cliente é consultado separadamente pelo monitor.')
+            st.caption('ITR mais recente nas bases ASN e histórico, incluindo OS abertas. O FIM informado no laudo é preservado; o FIM da cliente é consultado separadamente pelo monitor.')
             if st.button('↙️ PREENCHER ESTA ITR NO LAUDO',type='primary',use_container_width=True,key=f'aplicar_itr_{bulk_key}'):
                 fr=str(achado.get('frota','')).strip()
                 mask=bulk['FROTA'].astype(str).str.replace(r'\D','',regex=True).eq(re.sub(r'\D','',fr))
