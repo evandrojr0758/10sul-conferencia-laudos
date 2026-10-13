@@ -170,11 +170,9 @@ def hora(v):
 def supabase_upsert(rows,os_id,frota,compartimento):
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:return False,'Supabase ainda não configurado nos Secrets.'
     headers={'apikey':SUPABASE_SERVICE_KEY,'Authorization':f'Bearer {SUPABASE_SERVICE_KEY}','Content-Type':'application/json','Prefer':'return=minimal'}
-    qs=urllib.parse.urlencode({'os_id':f'eq.{os_id}','frota':f'eq.{frota}','compartimento':f'eq.{compartimento}'})
     try:
-        req=urllib.request.Request(f'{SUPABASE_URL}/rest/v1/laudos_monitor?{qs}',method='DELETE',headers=headers)
-        with urllib.request.urlopen(req,timeout=45) as r:r.read()
-        req=urllib.request.Request(f'{SUPABASE_URL}/rest/v1/laudos_monitor',data=json.dumps(rows,ensure_ascii=False).encode(),method='POST',headers=headers)
+        payload={'p_rows':rows,'p_os_id':os_id,'p_frota':frota,'p_compartimento':compartimento}
+        req=urllib.request.Request(f'{SUPABASE_URL}/rest/v1/rpc/salvar_laudo_preservando_evidencias',data=json.dumps(payload,ensure_ascii=False).encode(),method='POST',headers=headers)
         with urllib.request.urlopen(req,timeout=60) as r:r.read()
         return True,f'{len(rows)} atividade(s) sincronizada(s).'
     except urllib.error.HTTPError as e:return False,f'Supabase HTTP {e.code}: '+e.read().decode(errors='ignore')[:900]
@@ -253,6 +251,12 @@ def salvar_lote(df):
 
 st.title('📄 10 Sul • Central de Conferência de Laudos')
 st.caption('Portal independente para leitura e conferência de laudos escaneados. Somente dados confirmados são enviados ao monitor.')
+with st.expander('📷 Importar evidências de avarias do WhatsApp', expanded=False):
+    from evidencias import render_importador
+    try:
+        render_importador(st,SUPABASE_URL,SUPABASE_SERVICE_KEY)
+    except Exception as exc:
+        st.error('Não foi possível consultar as evidências: '+str(exc))
 def carregar_paginas(arquivos):
     paginas=[]
     digest=hashlib.sha256()
@@ -454,3 +458,4 @@ with right:
                         if prox:st.session_state['pag']=prox
                     else:st.error('Não foi possível sincronizar: '+msg)
     else:st.info('Clique em **LER ESTA PÁGINA COM GEMINI** e confira os dados olhando o laudo original.')
+
