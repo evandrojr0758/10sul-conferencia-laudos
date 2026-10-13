@@ -3,7 +3,7 @@ from io import BytesIO
 from datetime import datetime, date, time as dt_time
 import pandas as pd
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
 import fitz
 
 st.set_page_config(page_title='10 Sul • Conferência de Laudos', page_icon='📄', layout='wide')
@@ -20,16 +20,16 @@ SUPABASE_SERVICE_KEY = secret('SUPABASE_SERVICE_KEY')
 st.markdown('''<style>.block-container{max-width:1500px;padding-top:1.2rem}.stButton>button{border-radius:10px;font-weight:700}[data-testid="stMetric"]{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:10px 14px}</style>''', unsafe_allow_html=True)
 
 def buscar_ultima_itr_frota(frota):
-    """Busca na base publicada pelo sistema principal a ITR mais recente por início, incluindo OS abertas."""
+    """Busca na base publicada pelo sistema principal a ITR mais recente pelo início (ou parada, quando ainda não iniciou), independentemente do status."""
     fr=re.sub(r'\D','',str(frota or ''))
     if not fr:return None,'Informe a frota.'
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:return None,'Supabase não configurado.'
     params=urllib.parse.urlencode({
-        'select':'os_id,frota,evento,inicio,fim',
+        'select':'os_id,frota,evento,status,parada,inicio,fim',
         'frota':f'eq.{fr}',
         'evento':'ilike.*ITR*',
         'order':'inicio.desc.nullslast,parada.desc.nullslast',
-        'limit':'1'
+        'limit':'1000'
     })
     url=f'{SUPABASE_URL}/rest/v1/monitor_atendimentos?{params}'
     req=urllib.request.Request(url,headers={'apikey':SUPABASE_SERVICE_KEY,'Authorization':f'Bearer {SUPABASE_SERVICE_KEY}'})
@@ -37,7 +37,11 @@ def buscar_ultima_itr_frota(frota):
         with urllib.request.urlopen(req,timeout=30) as resp:
             rows=json.loads(resp.read().decode() or '[]')
         if not rows:return None,f'Nenhuma ITR encontrada para a frota {fr}.'
-        return rows[0],None
+        def data_referencia(row):
+            value=row.get('inicio') or row.get('parada')
+            stamp=pd.to_datetime(value,errors='coerce',utc=True)
+            return stamp.value if pd.notna(stamp) else -9223372036854775808
+        return max(rows,key=data_referencia),None
     except urllib.error.HTTPError as e:
         return None,f'Supabase HTTP {e.code}: '+e.read().decode(errors='ignore')[:500]
     except Exception as e:return None,str(e)
@@ -48,7 +52,7 @@ def parse_json(text):
     return json.loads(text)
 
 def preparar_imagem(png_bytes):
-    img=Image.open(BytesIO(png_bytes)).convert('RGB')
+    img=ImageOps.exif_transpose(Image.open(BytesIO(png_bytes))).convert('RGB')
     if max(img.size)>1800:
         k=1800/max(img.size); img=img.resize((int(img.width*k),int(img.height*k)))
     return img
@@ -222,12 +226,28 @@ def salvar_lote(df):
 
 st.title('📄 10 Sul • Central de Conferência de Laudos')
 st.caption('Portal independente para leitura e conferência de laudos escaneados. Somente dados confirmados são enviados ao monitor.')
-pdf=st.file_uploader('📤 Selecione o PDF com os laudos escaneados',type=['pdf'])
-if not pdf:st.info('Envie um PDF para iniciar a conferência página por página.');st.stop()
-pdf_bytes=pdf.getvalue();pdf_hash=hashlib.sha256(pdf_bytes).hexdigest()[:16]
-try:doc=fitz.open(stream=pdf_bytes,filetype='pdf')
-except Exception as e:st.error(f'Não foi possível abrir o PDF: {e}');st.stop()
-n=len(doc)
+def carregar_paginas(arquivos):
+    paginas=[]
+    digest=hashlib.sha256()
+    for arquivo in arquivos:
+        dados=arquivo.getvalue()
+        digest.update(len(dados).to_bytes(8,'big')); digest.update(dados)
+        if arquivo.name.lower().endswith('.pdf'):
+            with fitz.open(stream=dados,filetype='pdf') as documento:
+                for pagina in documento:
+                    paginas.append(pagina.get_pixmap(matrix=fitz.Matrix(1.6,1.6),alpha=False).tobytes('png'))
+        else:
+            with Image.open(BytesIO(dados)) as original:
+                img=ImageOps.exif_transpose(original).convert('RGB')
+                bio=BytesIO(); img.save(bio,format='PNG'); paginas.append(bio.getvalue())
+    if not paginas: raise ValueError('Nenhuma página encontrada nos arquivos.')
+    return paginas,digest.hexdigest()[:16]
+
+arquivos=st.file_uploader('📤 Selecione PDFs ou fotos dos laudos',type=['pdf','jpg','jpeg','png','webp'],accept_multiple_files=True)
+if not arquivos:st.info('Envie PDFs ou fotos para iniciar. Você pode selecionar vários arquivos juntos.');st.stop()
+try:paginas,pdf_hash=carregar_paginas(arquivos)
+except Exception as e:st.error(f'Não foi possível abrir os arquivos: {e}');st.stop()
+n=len(paginas)
 if st.session_state.get('pdf_hash')!=pdf_hash:
     st.session_state['pdf_hash']=pdf_hash;st.session_state['pag']=1;st.session_state['ok_pages']=set();st.session_state.pop('leitura',None)
 ok_pages=st.session_state.setdefault('ok_pages',set())
@@ -241,7 +261,7 @@ bulk_key=f'bulk_{pdf_hash}'
 if st.button(f'🤖 LER TODAS AS {n} PÁGINAS COM GEMINI',type='primary',use_container_width=True,key='ler_todas'):
     linhas=[]; falhas=[]; barra=st.progress(0,text='Iniciando leitura em lote...')
     for p in range(1,n+1):
-        pg=doc.load_page(p-1); px=pg.get_pixmap(matrix=fitz.Matrix(1.6,1.6),alpha=False); img=px.tobytes('png')
+        img=paginas[p-1]
         img_corrigida,rot=normalizar_orientacao(img)
         dados=ler_gemini(img_corrigida,ja_orientada=True)
         dados['_rotacao_aplicada']=rot
@@ -287,6 +307,8 @@ if isinstance(bulk,pd.DataFrame):
             resumo=pd.DataFrame([{
                 'ID':str(achado.get('os_id','')),
                 'FROTA':str(achado.get('frota','')),
+                'STATUS':str(achado.get('status') or ('Em manutenção' if pd.isna(fim) else 'Liberada')),
+                'PARADA':pd.to_datetime(achado.get('parada'),errors='coerce').strftime('%d/%m/%Y %H:%M') if pd.notna(pd.to_datetime(achado.get('parada'),errors='coerce')) else '',
                 'INICIO':'' if pd.isna(ini) else ini.strftime('%d/%m/%Y %H:%M'),
                 'FIM':'' if pd.isna(fim) else fim.strftime('%d/%m/%Y %H:%M')
             }])
@@ -294,9 +316,9 @@ if isinstance(bulk,pd.DataFrame):
             st.caption('ITR mais recente por início, incluindo OS abertas. O FIM informado no laudo é preservado; o FIM da cliente é consultado separadamente pelo monitor.')
             if st.button('↙️ PREENCHER ESTA ITR NO LAUDO',type='primary',use_container_width=True,key=f'aplicar_itr_{bulk_key}'):
                 fr=str(achado.get('frota','')).strip()
-                mask=bulk['FROTA'].astype(str).str.replace(r'\\D','',regex=True).eq(re.sub(r'\\D','',fr))
+                mask=bulk['FROTA'].astype(str).str.replace(r'\D','',regex=True).eq(re.sub(r'\D','',fr))
                 if not mask.any():
-                    st.warning(f'A frota {fr} não está nas linhas lidas deste PDF.')
+                    st.warning(f'A frota {fr} não está nas linhas lidas destes arquivos.')
                 else:
                     bulk.loc[mask,'ID']=str(achado.get('os_id',''))
                     bulk.loc[mask,'FROTA']=fr
@@ -340,7 +362,7 @@ if isinstance(bulk,pd.DataFrame):
             st.session_state.pop(bulk_key,None); st.session_state.pop(f'{bulk_key}_falhas',None); st.rerun()
 
 pag=st.number_input('Página',1,n,value=min(int(st.session_state.get('pag',1)),n),step=1);st.session_state['pag']=int(pag)
-page=doc.load_page(int(pag)-1);pix=page.get_pixmap(matrix=fitz.Matrix(1.6,1.6),alpha=False);png=pix.tobytes('png');preview,_=image_versions(png)
+png=paginas[int(pag)-1];preview,_=image_versions(png)
 rotkey=f'rot_{pdf_hash}_{pag}';st.session_state.setdefault(rotkey,False)
 if st.session_state[rotkey]:
     im=Image.open(BytesIO(preview)).convert('RGB').rotate(180,expand=True);b=BytesIO();im.save(b,format='PNG');preview=b.getvalue()
