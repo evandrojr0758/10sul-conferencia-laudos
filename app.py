@@ -1,4 +1,5 @@
 import os, re, json, base64, hashlib, urllib.request, urllib.error, urllib.parse
+import time
 from io import BytesIO
 from datetime import datetime, date, time as dt_time
 import pandas as pd
@@ -93,7 +94,7 @@ def image_versions(png_bytes):
     bio=BytesIO(); img.save(bio,format='PNG')
     return bio.getvalue(),[jpg_b64(img)]
 
-def ler_gemini(png_bytes, ja_orientada=False):
+def _ler_gemini_once(png_bytes, ja_orientada=False):
     if not GEMINI_API_KEY:return {'_erro':'GEMINI_API_KEY não configurada nos Secrets.'}
     if ja_orientada:
         img=preparar_imagem(png_bytes); rot=0
@@ -132,6 +133,16 @@ Retorne SOMENTE JSON:
         return data
     except urllib.error.HTTPError as e:return {'_erro':f'Gemini HTTP {e.code}: '+e.read().decode(errors='ignore')[:800]}
     except Exception as e:return {'_erro':f'{type(e).__name__}: {e}'}
+
+def ler_gemini(png_bytes, ja_orientada=False):
+    for tentativa in range(3):
+        resultado=_ler_gemini_once(png_bytes,ja_orientada=ja_orientada)
+        erro=str(resultado.get('_erro',''))
+        transitorio=bool(re.search(r'HTTP (429|500|502|503|504)\b',erro)) or any(x in erro.lower() for x in ('timed out','timeout','connection reset'))
+        if not transitorio or tentativa==2:
+            return resultado
+        time.sleep(2*(tentativa+1))
+
 
 def hora(v):
     t=str(v or '').strip()
@@ -348,6 +359,22 @@ if isinstance(bulk,pd.DataFrame):
                 '_COMPARTIMENTO':st.column_config.TextColumn('COMP.')
             }
         )
+        if falhas and st.button('🔄 RELER SOMENTE AS PÁGINAS COM FALHA',use_container_width=True,key=f'reler_falhas_{bulk_key}'):
+            novas=[]; restantes=[]
+            with st.spinner('Relendo as páginas que falharam...'):
+                for falha in falhas:
+                    match=re.match(r'Página (\\d+):',falha)
+                    if not match:
+                        restantes.append(falha); continue
+                    p=int(match.group(1))
+                    dados=ler_gemini(paginas[p-1])
+                    if dados.get('_erro'): restantes.append(f'Página {p}: {dados["_erro"]}')
+                    else: novas.extend(pagina_para_linhas(dados,p))
+            # Usa a grade editada para preservar a conferência das páginas já lidas.
+            st.session_state[bulk_key]=pd.concat([edit,pd.DataFrame(novas)],ignore_index=True) if novas else edit.copy()
+            st.session_state[f'{bulk_key}_falhas']=restantes
+            st.session_state[f'editor_rev_{bulk_key}']=_rev+1
+            st.rerun()
         a,b=st.columns([3,1])
         selecionadas=int(edit['SELECIONAR'].fillna(False).astype(bool).sum()) if 'SELECIONAR' in edit.columns else len(edit)
         a.caption(f'{selecionadas} atividade(s) marcada(s) para gravação. Desmarcadas serão ignoradas inclusive nas validações.')
