@@ -204,7 +204,7 @@ def pagina_para_linhas(data, pagina):
         if not serv: continue
         cl=str(a.get('classificacao','') or '').upper().strip()
         rows.append({
-            'SELECIONAR':True,'ID':osid,'FROTA':frota,'INICIO OS':ini_os,'FIM OS':fim_os,
+            'SELECIONAR':False,'ID':osid,'FROTA':frota,'INICIO OS':ini_os,'FIM OS':fim_os,
             'ATIVIDADE/DESCRIÇÃO':serv,'EXECUTANTE':str(a.get('executante','') or '').strip(),
             'ITR':cl=='ITR','CNP':cl=='CNP','GM':cl=='GM','OUTROS':cl=='OUTROS',
             'INICIO':str(a.get('inicio','') or '').strip(),'FIM':str(a.get('fim','') or '').strip(),
@@ -320,7 +320,15 @@ if isinstance(bulk,pd.DataFrame):
     else:
         cols=['SELECIONAR','ID','FROTA','INICIO OS','FIM OS','ATIVIDADE/DESCRIÇÃO','EXECUTANTE','ITR','CNP','GM','OUTROS','INICIO','FIM','_PAGINA','_COMPARTIMENTO']
         for c in cols:
-            if c not in bulk.columns: bulk[c]=True if c=='SELECIONAR' else ''
+            if c not in bulk.columns: bulk[c]=False if c=='SELECIONAR' else ''
+        # A seleção representa as frotas vinculadas nesta conferência.
+        # Limpa também grades abertas antes da atualização, uma única vez por lote.
+        if not st.session_state.get(f'selecao_por_vinculo_v1_{bulk_key}'):
+            bulk['SELECIONAR']=False
+            st.session_state[bulk_key]=bulk
+            st.session_state[f'selecao_por_vinculo_v1_{bulk_key}']=True
+            st.session_state[f'editor_rev_{bulk_key}']=st.session_state.get(f'editor_rev_{bulk_key}',0)+1
+        st.caption('As atividades começam desmarcadas. Ao preencher a ITR, somente as linhas da frota vinculada são marcadas.')
         st.markdown('#### 🔎 Buscar última ITR pela frota')
         q1,q2=st.columns([2,1])
         frota_busca=q1.text_input('FROTA',placeholder='Ex.: 13809',key=f'buscar_frota_{bulk_key}')
@@ -354,6 +362,7 @@ if isinstance(bulk,pd.DataFrame):
                 else:
                     bulk.loc[mask,'ID']=str(achado.get('os_id',''))
                     bulk.loc[mask,'FROTA']=fr
+                    bulk.loc[mask,'SELECIONAR']=True
                     bulk.loc[mask,'INICIO OS']='' if pd.isna(ini) else ini.strftime('%d/%m/%Y %H:%M')
                     # Nunca apagar ou substituir o FIM informado pelo conferente.
                     fim_vazio=bulk['FIM OS'].fillna('').astype(str).str.strip().eq('')
