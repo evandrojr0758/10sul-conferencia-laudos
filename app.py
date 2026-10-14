@@ -191,10 +191,11 @@ def pagina_para_linhas(data, pagina):
     dia=d0.date()
     def osdt(v):
         s=str(v or '').strip()
-        z=pd.to_datetime(s,dayfirst=True,errors='coerce')
-        if not pd.isna(z) and (':' in s or 'T' in s): return z.strftime('%d/%m/%Y %H:%M')
+        # Hora sem data pertence ao dia informado no laudo; pandas usaria hoje.
         h=hora(s)
-        return datetime.combine(dia,h).strftime('%d/%m/%Y %H:%M') if h else ''
+        if h: return datetime.combine(dia,h).strftime('%d/%m/%Y %H:%M')
+        z=pd.to_datetime(s,dayfirst=True,errors='coerce')
+        return z.strftime('%d/%m/%Y %H:%M') if not pd.isna(z) and (':' in s or 'T' in s) else ''
     ini_os=osdt(data.get('inicio_manutencao'))
     fim_os=osdt(data.get('fim_manutencao'))
     rows=[]
@@ -430,6 +431,8 @@ with right:
         d0=pd.to_datetime(data.get('data_inspecao'),dayfirst=True,errors='coerce');d0=pd.Timestamp.today() if pd.isna(d0) else d0;dia=st.date_input('Data do laudo',d0.date(),key=f'data_{key}')
         comps=['1º','2º','3º'];cr=str(data.get('compartimento','1º'));comp=next((x for x in comps if x[0] in cr),'1º');comp=st.selectbox('COMPARTIMENTO',comps,index=comps.index(comp),key=f'cp_{key}')
         def dtval(v):
+            h=hora(v)
+            if h: return datetime.combine(dia,h)
             z=pd.to_datetime(v,dayfirst=True,errors='coerce');return datetime.combine(dia,dt_time(0,0)) if pd.isna(z) else z.to_pydatetime()
         ini=dtval(data.get('inicio_manutencao'));fim=dtval(data.get('fim_manutencao'));x1,x2=st.columns(2);di=x1.date_input('DATA INÍCIO MANUTENÇÃO',ini.date(),key=f'di_{key}');hi=x1.time_input('HORA INÍCIO MANUTENÇÃO',ini.time().replace(second=0,microsecond=0),key=f'hi_{key}');df=x2.date_input('DATA FIM MANUTENÇÃO',fim.date(),key=f'df_{key}');hf=x2.time_input('HORA FIM MANUTENÇÃO',fim.time().replace(second=0,microsecond=0),key=f'hf_{key}');ini_m=datetime.combine(di,hi);fim_m=datetime.combine(df,hf)
         at=pd.DataFrame(data.get('atividades',[]) or [{'servico':'','classificacao':'ITR','inicio':'','fim':''}]).rename(columns={'servico':'ATIVIDADE/DESCRIÇÃO','classificacao':'CLASSIFICAÇÃO','inicio':'INÍCIO','fim':'FIM'})
